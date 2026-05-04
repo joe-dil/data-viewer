@@ -27,6 +27,7 @@
 typedef struct Buffer {
     char *data;
     size_t len;
+    bool is_mmap;  // true: data was mmap'd; false: malloc'd or borrowed
 } Buffer;
 
 typedef struct CellRef {
@@ -79,6 +80,7 @@ static Buffer buffer_load(const char *path) {
 
     buf.data = mmap(NULL, buf.len, PROT_READ, MAP_PRIVATE, fd, 0);
     if (buf.data == MAP_FAILED) { perror("mmap"); buf.data = NULL; }
+    else buf.is_mmap = true;
     close(fd);
     return buf;
 }
@@ -118,7 +120,10 @@ static ParsedCSV parsed_csv_init(Buffer buf) {
 }
 
 static void parsed_csv_free(ParsedCSV *csv) {
-    if (csv->buf.data) munmap(csv->buf.data, csv->buf.len);
+    if (csv->buf.data) {
+        if (csv->buf.is_mmap) munmap(csv->buf.data, csv->buf.len);
+        else free(csv->buf.data);
+    }
     free(csv->cells);
     free(csv->row_start);
     *csv = (ParsedCSV){0};
@@ -249,6 +254,1259 @@ static size_t cell_decode(const ParsedCSV *csv, const CellRef *cell,
 }
 
 // ============================================================================
+// puff.c - DEFLATE inflate (vendored from zlib)
+// ============================================================================
+// Copyright (C) 2002-2013 Mark Adler. All rights reserved.
+//
+// This software is provided 'as-is', without any express or implied
+// warranty. In no event will the author be held liable for any damages
+// arising from the use of this software.
+//
+// Permission is granted to anyone to use this software for any purpose,
+// including commercial applications, and to alter it and redistribute it
+// freely, subject to the following restrictions:
+//
+//   1. The origin of this software must not be misrepresented; you must
+//      not claim that you wrote the original software.
+//   2. Altered source versions must be plainly marked as such, and must
+//      not be misrepresented as being the original software.
+//   3. This notice may not be removed or altered from any source
+//      distribution.
+//
+// puff.c v2.3 (21 Jan 2013) - Mark Adler. Inlined verbatim from
+// https://github.com/madler/zlib/blob/master/contrib/puff/puff.c
+// (with #include "puff.h" replaced by an inline prototype, and #undefs
+// at the end to keep its macros from leaking into the rest of the file).
+// ============================================================================
+
+#include <setjmp.h>
+
+#ifndef NIL
+#  define NIL ((unsigned char *)0)
+#endif
+
+static int puff(unsigned char *dest, unsigned long *destlen,
+                const unsigned char *source, unsigned long *sourcelen);
+
+#define local static
+
+#define MAXBITS 15
+#define MAXLCODES 286
+#define MAXDCODES 30
+#define MAXCODES (MAXLCODES+MAXDCODES)
+#define FIXLCODES 288
+
+struct state {
+    unsigned char *out;
+    unsigned long outlen;
+    unsigned long outcnt;
+    const unsigned char *in;
+    unsigned long inlen;
+    unsigned long incnt;
+    int bitbuf;
+    int bitcnt;
+    jmp_buf env;
+};
+
+local int bits(struct state *s, int need)
+{
+    long val;
+    val = s->bitbuf;
+    while (s->bitcnt < need) {
+        if (s->incnt == s->inlen)
+            longjmp(s->env, 1);
+        val |= (long)(s->in[s->incnt++]) << s->bitcnt;
+        s->bitcnt += 8;
+    }
+    s->bitbuf = (int)(val >> need);
+    s->bitcnt -= need;
+    return (int)(val & ((1L << need) - 1));
+}
+
+local int stored(struct state *s)
+{
+    unsigned len;
+    s->bitbuf = 0;
+    s->bitcnt = 0;
+    if (s->incnt + 4 > s->inlen)
+        return 2;
+    len = s->in[s->incnt++];
+    len |= s->in[s->incnt++] << 8;
+    if (s->in[s->incnt++] != (~len & 0xff) ||
+        s->in[s->incnt++] != ((~len >> 8) & 0xff))
+        return -2;
+    if (s->incnt + len > s->inlen)
+        return 2;
+    if (s->out != NIL) {
+        if (s->outcnt + len > s->outlen)
+            return 1;
+        while (len--)
+            s->out[s->outcnt++] = s->in[s->incnt++];
+    }
+    else {
+        s->outcnt += len;
+        s->incnt += len;
+    }
+    return 0;
+}
+
+struct huffman {
+    short *count;
+    short *symbol;
+};
+
+local int decode(struct state *s, const struct huffman *h)
+{
+    int len;
+    int code;
+    int first;
+    int count;
+    int index;
+    int bitbuf;
+    int left;
+    short *next;
+
+    bitbuf = s->bitbuf;
+    left = s->bitcnt;
+    code = first = index = 0;
+    len = 1;
+    next = h->count + 1;
+    while (1) {
+        while (left--) {
+            code |= bitbuf & 1;
+            bitbuf >>= 1;
+            count = *next++;
+            if (code - count < first) {
+                s->bitbuf = bitbuf;
+                s->bitcnt = (s->bitcnt - len) & 7;
+                return h->symbol[index + (code - first)];
+            }
+            index += count;
+            first += count;
+            first <<= 1;
+            code <<= 1;
+            len++;
+        }
+        left = (MAXBITS+1) - len;
+        if (left == 0)
+            break;
+        if (s->incnt == s->inlen)
+            longjmp(s->env, 1);
+        bitbuf = s->in[s->incnt++];
+        if (left > 8)
+            left = 8;
+    }
+    return -10;
+}
+
+local int construct(struct huffman *h, const short *length, int n)
+{
+    int symbol;
+    int len;
+    int left;
+    short offs[MAXBITS+1];
+
+    for (len = 0; len <= MAXBITS; len++)
+        h->count[len] = 0;
+    for (symbol = 0; symbol < n; symbol++)
+        (h->count[length[symbol]])++;
+    if (h->count[0] == n)
+        return 0;
+
+    left = 1;
+    for (len = 1; len <= MAXBITS; len++) {
+        left <<= 1;
+        left -= h->count[len];
+        if (left < 0)
+            return left;
+    }
+
+    offs[1] = 0;
+    for (len = 1; len < MAXBITS; len++)
+        offs[len + 1] = offs[len] + h->count[len];
+
+    for (symbol = 0; symbol < n; symbol++)
+        if (length[symbol] != 0)
+            h->symbol[offs[length[symbol]]++] = symbol;
+
+    return left;
+}
+
+local int codes(struct state *s,
+                const struct huffman *lencode,
+                const struct huffman *distcode)
+{
+    int symbol;
+    int len;
+    unsigned dist;
+    static const short lens[29] = {
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const short lext[29] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const short dists[30] = {
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+        8193, 12289, 16385, 24577};
+    static const short dext[30] = {
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+        7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+        12, 12, 13, 13};
+
+    do {
+        symbol = decode(s, lencode);
+        if (symbol < 0)
+            return symbol;
+        if (symbol < 256) {
+            if (s->out != NIL) {
+                if (s->outcnt == s->outlen)
+                    return 1;
+                s->out[s->outcnt] = symbol;
+            }
+            s->outcnt++;
+        }
+        else if (symbol > 256) {
+            symbol -= 257;
+            if (symbol >= 29)
+                return -10;
+            len = lens[symbol] + bits(s, lext[symbol]);
+
+            symbol = decode(s, distcode);
+            if (symbol < 0)
+                return symbol;
+            dist = dists[symbol] + bits(s, dext[symbol]);
+            if (dist > s->outcnt)
+                return -11;
+
+            if (s->out != NIL) {
+                if (s->outcnt + len > s->outlen)
+                    return 1;
+                while (len--) {
+                    s->out[s->outcnt] = s->out[s->outcnt - dist];
+                    s->outcnt++;
+                }
+            }
+            else
+                s->outcnt += len;
+        }
+    } while (symbol != 256);
+
+    return 0;
+}
+
+local int fixed(struct state *s)
+{
+    static int virgin = 1;
+    static short lencnt[MAXBITS+1], lensym[FIXLCODES];
+    static short distcnt[MAXBITS+1], distsym[MAXDCODES];
+    static struct huffman lencode, distcode;
+
+    if (virgin) {
+        int symbol;
+        short lengths[FIXLCODES];
+
+        lencode.count = lencnt;
+        lencode.symbol = lensym;
+        distcode.count = distcnt;
+        distcode.symbol = distsym;
+
+        for (symbol = 0; symbol < 144; symbol++)
+            lengths[symbol] = 8;
+        for (; symbol < 256; symbol++)
+            lengths[symbol] = 9;
+        for (; symbol < 280; symbol++)
+            lengths[symbol] = 7;
+        for (; symbol < FIXLCODES; symbol++)
+            lengths[symbol] = 8;
+        construct(&lencode, lengths, FIXLCODES);
+
+        for (symbol = 0; symbol < MAXDCODES; symbol++)
+            lengths[symbol] = 5;
+        construct(&distcode, lengths, MAXDCODES);
+
+        virgin = 0;
+    }
+
+    return codes(s, &lencode, &distcode);
+}
+
+local int dynamic(struct state *s)
+{
+    int nlen, ndist, ncode;
+    int index;
+    int err;
+    short lengths[MAXCODES];
+    short lencnt[MAXBITS+1], lensym[MAXLCODES];
+    short distcnt[MAXBITS+1], distsym[MAXDCODES];
+    struct huffman lencode, distcode;
+    static const short order[19] =
+        {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+    lencode.count = lencnt;
+    lencode.symbol = lensym;
+    distcode.count = distcnt;
+    distcode.symbol = distsym;
+
+    nlen = bits(s, 5) + 257;
+    ndist = bits(s, 5) + 1;
+    ncode = bits(s, 4) + 4;
+    if (nlen > MAXLCODES || ndist > MAXDCODES)
+        return -3;
+
+    for (index = 0; index < ncode; index++)
+        lengths[order[index]] = bits(s, 3);
+    for (; index < 19; index++)
+        lengths[order[index]] = 0;
+
+    err = construct(&lencode, lengths, 19);
+    if (err != 0)
+        return -4;
+
+    index = 0;
+    while (index < nlen + ndist) {
+        int symbol;
+        int len;
+
+        symbol = decode(s, &lencode);
+        if (symbol < 0)
+            return symbol;
+        if (symbol < 16)
+            lengths[index++] = symbol;
+        else {
+            len = 0;
+            if (symbol == 16) {
+                if (index == 0)
+                    return -5;
+                len = lengths[index - 1];
+                symbol = 3 + bits(s, 2);
+            }
+            else if (symbol == 17)
+                symbol = 3 + bits(s, 3);
+            else
+                symbol = 11 + bits(s, 7);
+            if (index + symbol > nlen + ndist)
+                return -6;
+            while (symbol--)
+                lengths[index++] = len;
+        }
+    }
+
+    if (lengths[256] == 0)
+        return -9;
+
+    err = construct(&lencode, lengths, nlen);
+    if (err && (err < 0 || nlen != lencode.count[0] + lencode.count[1]))
+        return -7;
+
+    err = construct(&distcode, lengths + nlen, ndist);
+    if (err && (err < 0 || ndist != distcode.count[0] + distcode.count[1]))
+        return -8;
+
+    return codes(s, &lencode, &distcode);
+}
+
+static int puff(unsigned char *dest, unsigned long *destlen,
+                const unsigned char *source, unsigned long *sourcelen)
+{
+    struct state s;
+    int last, type;
+    int err;
+
+    s.out = dest;
+    s.outlen = *destlen;
+    s.outcnt = 0;
+
+    s.in = source;
+    s.inlen = *sourcelen;
+    s.incnt = 0;
+    s.bitbuf = 0;
+    s.bitcnt = 0;
+
+    if (setjmp(s.env) != 0)
+        err = 2;
+    else {
+        do {
+            last = bits(&s, 1);
+            type = bits(&s, 2);
+            err = type == 0 ?
+                    stored(&s) :
+                    (type == 1 ?
+                        fixed(&s) :
+                        (type == 2 ?
+                            dynamic(&s) :
+                            -1));
+            if (err != 0)
+                break;
+        } while (!last);
+    }
+
+    if (err <= 0) {
+        *destlen = s.outcnt;
+        *sourcelen = s.incnt;
+    }
+    return err;
+}
+
+#undef local
+#undef MAXBITS
+#undef MAXLCODES
+#undef MAXDCODES
+#undef MAXCODES
+#undef FIXLCODES
+
+// ============================================================================
+// End of vendored puff.c
+// ============================================================================
+// ============================================================================
+// XLSX Reader
+// ============================================================================
+//
+// An .xlsx file is a ZIP archive of XML parts. We need:
+//   xl/workbook.xml             - list of sheets (name + relationship id)
+//   xl/_rels/workbook.xml.rels  - maps relationship ids to sheet XML paths
+//   xl/sharedStrings.xml        - shared string table (sst)
+//   xl/worksheets/sheet*.xml    - actual cell data per sheet
+//
+// We parse these by tag-scanning the bytes (no full XML parser). For each sheet
+// we materialize its cells into a properly-quoted CSV byte buffer that the
+// existing parsed_csv_parse can consume — that way the parser stays the single
+// source of truth for what "a row" looks like.
+// ============================================================================
+
+#include <ctype.h>
+
+typedef struct {
+    char *name;     // owned: sheet name (UTF-8)
+    char *rid;      // owned: relationship id, e.g. "rId1"
+    char *target;   // owned: zip entry path, e.g. "xl/worksheets/sheet1.xml"
+} XlsxSheetMeta;
+
+typedef struct {
+    Buffer          file_buf;       // mmap of the xlsx file (owned)
+    char          **shared_strings; // sst[i], owned strings
+    size_t          sst_count;
+    XlsxSheetMeta  *sheets;
+    size_t          sheet_count;
+} XlsxFile;
+
+// ---------------- ZIP central-directory walker ----------------
+
+#define ZIP_EOCD_SIG   0x06054b50u
+#define ZIP_CDIR_SIG   0x02014b50u
+#define ZIP_LOCAL_SIG  0x04034b50u
+
+static uint16_t zip_le16(const uint8_t *p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+static uint32_t zip_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Find the End-Of-Central-Directory record by scanning backward from EOF.
+// EOCD is at most 65557 bytes from EOF (22-byte fixed + up to 0xFFFF comment).
+// Returns offset of the EOCD signature within buf, or (size_t)-1 if not found.
+static size_t zip_find_eocd(const uint8_t *buf, size_t len) {
+    if (len < 22) return (size_t)-1;
+    size_t max_back = len < 65557 ? len : 65557;
+    for (size_t i = len - 22; ; i--) {
+        if (zip_le32(buf + i) == ZIP_EOCD_SIG) return i;
+        if (i == 0 || (len - i) >= max_back) break;
+    }
+    return (size_t)-1;
+}
+
+// Locate a zip entry by its filename. On success, fill *comp_method,
+// *comp_size, *uncomp_size, and *local_header_off.
+// Returns true if found.
+static bool zip_find_entry(const Buffer *zip, const char *name,
+                           uint16_t *comp_method, uint32_t *comp_size,
+                           uint32_t *uncomp_size, uint32_t *local_off) {
+    const uint8_t *buf = (const uint8_t *)zip->data;
+    size_t len = zip->len;
+
+    size_t eocd = zip_find_eocd(buf, len);
+    if (eocd == (size_t)-1) return false;
+
+    uint16_t total_entries = zip_le16(buf + eocd + 10);
+    uint32_t cdir_size     = zip_le32(buf + eocd + 12);
+    uint32_t cdir_off      = zip_le32(buf + eocd + 16);
+
+    if ((size_t)cdir_off + cdir_size > len) return false;
+
+    size_t name_len = strlen(name);
+    size_t p = cdir_off;
+    for (uint16_t i = 0; i < total_entries; i++) {
+        if (p + 46 > (size_t)cdir_off + cdir_size) return false;
+        if (zip_le32(buf + p) != ZIP_CDIR_SIG) return false;
+
+        uint16_t method      = zip_le16(buf + p + 10);
+        uint32_t csize       = zip_le32(buf + p + 20);
+        uint32_t usize       = zip_le32(buf + p + 24);
+        uint16_t fname_len   = zip_le16(buf + p + 28);
+        uint16_t extra_len   = zip_le16(buf + p + 30);
+        uint16_t comment_len = zip_le16(buf + p + 32);
+        uint32_t loc_off     = zip_le32(buf + p + 42);
+
+        const uint8_t *fname = buf + p + 46;
+        if (p + 46 + fname_len > len) return false;
+
+        if (fname_len == name_len && memcmp(fname, name, name_len) == 0) {
+            *comp_method  = method;
+            *comp_size    = csize;
+            *uncomp_size  = usize;
+            *local_off    = loc_off;
+            return true;
+        }
+
+        p += 46 + fname_len + extra_len + comment_len;
+    }
+    return false;
+}
+
+// Read and decompress a zip entry by name. On success, returns a malloc'd
+// buffer of size *out_len (caller must free). Returns NULL on any failure.
+static uint8_t *zip_read_entry(const Buffer *zip, const char *name, size_t *out_len) {
+    uint16_t method;
+    uint32_t csize, usize, loc_off;
+    if (!zip_find_entry(zip, name, &method, &csize, &usize, &loc_off)) return NULL;
+
+    const uint8_t *buf = (const uint8_t *)zip->data;
+    size_t len = zip->len;
+
+    if ((size_t)loc_off + 30 > len) return NULL;
+    if (zip_le32(buf + loc_off) != ZIP_LOCAL_SIG) return NULL;
+
+    uint16_t fname_len = zip_le16(buf + loc_off + 26);
+    uint16_t extra_len = zip_le16(buf + loc_off + 28);
+    size_t data_off = (size_t)loc_off + 30 + fname_len + extra_len;
+    if (data_off + csize > len) return NULL;
+
+    uint8_t *out = malloc(usize > 0 ? usize : 1);
+    if (!out) return NULL;
+
+    if (method == 0) {
+        // stored
+        if (csize != usize) { free(out); return NULL; }
+        memcpy(out, buf + data_off, usize);
+    } else if (method == 8) {
+        // deflated
+        unsigned long destlen = usize;
+        unsigned long srclen  = csize;
+        int rc = puff(out, &destlen, buf + data_off, &srclen);
+        if (rc != 0 || destlen != usize) { free(out); return NULL; }
+    } else {
+        free(out);
+        return NULL;
+    }
+
+    *out_len = usize;
+    return out;
+}
+
+// ---------------- XML tag scanning helpers ----------------
+
+// Find next opening occurrence of tag name (e.g. "sheet") starting from p.
+// Returns pointer to '<' or NULL if not found.
+// Matches both "<tag>" and "<tag " and "<tag/" (i.e. tag is followed by space, '>' or '/').
+static const char *xml_find_open_tag(const char *p, const char *end, const char *tag) {
+    size_t tlen = strlen(tag);
+    while (p && p < end) {
+        const char *lt = memchr(p, '<', (size_t)(end - p));
+        if (!lt) return NULL;
+        const char *q = lt + 1;
+        if (q + tlen <= end && memcmp(q, tag, tlen) == 0) {
+            char term = q[tlen];
+            if (term == ' ' || term == '>' || term == '/' || term == '\t'
+                    || term == '\n' || term == '\r') {
+                return lt;
+            }
+        }
+        p = lt + 1;
+    }
+    return NULL;
+}
+
+// Given a pointer to '<tag', skip to the end of the opening tag ('>') and
+// return a pointer just after it. Sets *self_closing to true if it ends with '/>'.
+static const char *xml_skip_tag_open(const char *p, const char *end, bool *self_closing) {
+    *self_closing = false;
+    while (p < end) {
+        if (*p == '>') {
+            if (p > end && p[-1] == '/') *self_closing = true;
+            return p + 1;
+        }
+        if (*p == '"') {
+            p++;
+            while (p < end && *p != '"') p++;
+            if (p < end) p++;
+            continue;
+        }
+        if (*p == '/' && p + 1 < end && p[1] == '>') {
+            *self_closing = true;
+            return p + 2;
+        }
+        p++;
+    }
+    return end;
+}
+
+// Within an opening tag (between `<tag` and `>` or `/>`), find an attribute by
+// name. Returns true and fills *val_start, *val_len with the attribute's value
+// (no decoding of XML entities). Returns false if attribute not found.
+static bool xml_get_attr(const char *tag_start, const char *tag_end,
+                         const char *attr_name, const char **val_start, size_t *val_len) {
+    size_t alen = strlen(attr_name);
+    const char *p = tag_start;
+    while (p < tag_end) {
+        // skip whitespace
+        while (p < tag_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        if (p >= tag_end) break;
+        // attribute name starts here
+        const char *aname = p;
+        while (p < tag_end && *p != '=' && *p != ' ' && *p != '\t'
+                && *p != '\n' && *p != '\r' && *p != '/' && *p != '>') p++;
+        size_t aname_len = (size_t)(p - aname);
+        // skip to '=' if any
+        while (p < tag_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        if (p >= tag_end || *p != '=') { p++; continue; }
+        p++;
+        while (p < tag_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        if (p >= tag_end || (*p != '"' && *p != '\'')) continue;
+        char quote = *p++;
+        const char *vstart = p;
+        while (p < tag_end && *p != quote) p++;
+        if (p >= tag_end) return false;
+        if (aname_len == alen && memcmp(aname, attr_name, alen) == 0) {
+            *val_start = vstart;
+            *val_len   = (size_t)(p - vstart);
+            return true;
+        }
+        p++; // past closing quote
+    }
+    return false;
+}
+
+// Decode XML entities in [src, src+len) to dst (malloc'd, NUL-terminated).
+// Recognized: &amp; &lt; &gt; &quot; &apos; &#NN; &#xHH;
+static char *xml_decode(const char *src, size_t len) {
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < len; ) {
+        if (src[i] != '&') { out[j++] = src[i++]; continue; }
+        // find ';'
+        size_t k = i + 1;
+        while (k < len && k < i + 16 && src[k] != ';') k++;
+        if (k >= len || src[k] != ';') { out[j++] = src[i++]; continue; }
+        size_t ent_len = k - i - 1;
+        const char *ent = src + i + 1;
+        if (ent_len == 3 && memcmp(ent, "amp", 3) == 0) out[j++] = '&';
+        else if (ent_len == 2 && memcmp(ent, "lt", 2) == 0) out[j++] = '<';
+        else if (ent_len == 2 && memcmp(ent, "gt", 2) == 0) out[j++] = '>';
+        else if (ent_len == 4 && memcmp(ent, "quot", 4) == 0) out[j++] = '"';
+        else if (ent_len == 4 && memcmp(ent, "apos", 4) == 0) out[j++] = '\'';
+        else if (ent_len > 1 && ent[0] == '#') {
+            unsigned long cp = 0;
+            if (ent[1] == 'x' || ent[1] == 'X') {
+                for (size_t m = 2; m < ent_len; m++) {
+                    char c = ent[m];
+                    if (c >= '0' && c <= '9') cp = cp * 16 + (c - '0');
+                    else if (c >= 'a' && c <= 'f') cp = cp * 16 + 10 + (c - 'a');
+                    else if (c >= 'A' && c <= 'F') cp = cp * 16 + 10 + (c - 'A');
+                    else { cp = 0; break; }
+                }
+            } else {
+                for (size_t m = 1; m < ent_len; m++) {
+                    char c = ent[m];
+                    if (c >= '0' && c <= '9') cp = cp * 10 + (c - '0');
+                    else { cp = 0; break; }
+                }
+            }
+            // UTF-8 encode the codepoint
+            if (cp < 0x80) {
+                out[j++] = (char)cp;
+            } else if (cp < 0x800) {
+                out[j++] = (char)(0xC0 | (cp >> 6));
+                out[j++] = (char)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                out[j++] = (char)(0xE0 | (cp >> 12));
+                out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                out[j++] = (char)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x110000) {
+                out[j++] = (char)(0xF0 | (cp >> 18));
+                out[j++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                out[j++] = (char)(0x80 | (cp & 0x3F));
+            } else {
+                out[j++] = '?';
+            }
+        } else {
+            // unknown entity: pass through literally
+            out[j++] = '&';
+            i++;
+            continue;
+        }
+        i = k + 1;
+    }
+    out[j] = '\0';
+    return out;
+}
+
+// Find the inner text of the next <t>...</t> element starting at p (returns
+// pointer past </t>, sets *text_start/*text_len). Skips XML attributes on <t>
+// (e.g. xml:space="preserve"). Returns NULL if not found.
+static const char *xml_next_t_text(const char *p, const char *end,
+                                   const char **text_start, size_t *text_len) {
+    const char *open = xml_find_open_tag(p, end, "t");
+    if (!open) return NULL;
+    bool self_closing;
+    const char *body = xml_skip_tag_open(open + 2, end, &self_closing);
+    if (self_closing) { *text_start = body; *text_len = 0; return body; }
+    // find </t>
+    const char *q = body;
+    while (q < end) {
+        if (q + 4 <= end && q[0] == '<' && q[1] == '/' && q[2] == 't' && q[3] == '>') {
+            *text_start = body;
+            *text_len = (size_t)(q - body);
+            return q + 4;
+        }
+        q++;
+    }
+    return NULL;
+}
+
+// ---------------- Shared strings parsing ----------------
+
+// Parse xl/sharedStrings.xml. Each <si> contains either a single <t> or one or
+// more <r><t>...</t></r> rich-text runs (concatenated).
+static bool xlsx_parse_shared_strings(const uint8_t *xml, size_t xml_len,
+                                      char ***out_arr, size_t *out_count) {
+    const char *p = (const char *)xml;
+    const char *end = p + xml_len;
+
+    char **arr = NULL;
+    size_t count = 0, cap = 0;
+
+    while (p < end) {
+        const char *si = xml_find_open_tag(p, end, "si");
+        if (!si) break;
+        bool sc;
+        const char *body = xml_skip_tag_open(si + 3, end, &sc);
+        // Find </si>
+        const char *si_end = body;
+        const char *closer = NULL;
+        while (si_end < end) {
+            if (si_end + 5 <= end && memcmp(si_end, "</si>", 5) == 0) {
+                closer = si_end;
+                break;
+            }
+            si_end++;
+        }
+        if (!closer) closer = end;
+
+        // Concatenate all <t> texts within [body, closer).
+        char *concat = NULL;
+        size_t concat_len = 0, concat_cap = 0;
+        const char *tp = body;
+        while (tp < closer) {
+            const char *tstart;
+            size_t tlen;
+            const char *adv = xml_next_t_text(tp, closer, &tstart, &tlen);
+            if (!adv) break;
+            char *decoded = xml_decode(tstart, tlen);
+            if (!decoded) { free(concat); goto fail; }
+            size_t dlen = strlen(decoded);
+            if (concat_len + dlen + 1 > concat_cap) {
+                size_t nc = concat_cap ? concat_cap * 2 : 64;
+                while (nc < concat_len + dlen + 1) nc *= 2;
+                char *tmp = realloc(concat, nc);
+                if (!tmp) { free(decoded); free(concat); goto fail; }
+                concat = tmp;
+                concat_cap = nc;
+            }
+            memcpy(concat + concat_len, decoded, dlen);
+            concat_len += dlen;
+            concat[concat_len] = '\0';
+            free(decoded);
+            tp = adv;
+        }
+        if (!concat) {
+            concat = strdup("");
+            if (!concat) goto fail;
+        }
+
+        if (count >= cap) {
+            size_t nc = cap ? cap * 2 : 64;
+            char **na = realloc(arr, nc * sizeof(char*));
+            if (!na) { free(concat); goto fail; }
+            arr = na;
+            cap = nc;
+        }
+        arr[count++] = concat;
+
+        p = closer + 5;
+    }
+
+    *out_arr = arr;
+    *out_count = count;
+    return true;
+
+fail:
+    for (size_t i = 0; i < count; i++) free(arr[i]);
+    free(arr);
+    return false;
+}
+
+// ---------------- Workbook + rels parsing ----------------
+
+// Parse xl/workbook.xml: collect <sheet name="..." sheetId="..." r:id="..."/>
+static bool xlsx_parse_workbook(const uint8_t *xml, size_t xml_len,
+                                XlsxSheetMeta **out_sheets, size_t *out_count) {
+    const char *p = (const char *)xml;
+    const char *end = p + xml_len;
+
+    XlsxSheetMeta *sheets = NULL;
+    size_t count = 0, cap = 0;
+
+    while (p < end) {
+        const char *open = xml_find_open_tag(p, end, "sheet");
+        if (!open) break;
+        // The opening tag goes from `<sheet` until '>' or '/>'.
+        const char *attr_start = open + 6; // past "<sheet"
+        bool sc;
+        const char *after = xml_skip_tag_open(attr_start, end, &sc);
+        const char *attr_end = sc ? after - 2 : after - 1;
+
+        const char *vs; size_t vl;
+        char *name = NULL, *rid = NULL;
+        if (xml_get_attr(attr_start, attr_end, "name", &vs, &vl))
+            name = xml_decode(vs, vl);
+        if (xml_get_attr(attr_start, attr_end, "r:id", &vs, &vl))
+            rid = xml_decode(vs, vl);
+
+        if (!name || !rid) {
+            free(name); free(rid);
+            p = after;
+            continue;
+        }
+
+        if (count >= cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            XlsxSheetMeta *ns = realloc(sheets, nc * sizeof(XlsxSheetMeta));
+            if (!ns) { free(name); free(rid); goto fail; }
+            sheets = ns;
+            cap = nc;
+        }
+        sheets[count].name   = name;
+        sheets[count].rid    = rid;
+        sheets[count].target = NULL;  // resolved later from rels
+        count++;
+
+        p = after;
+    }
+
+    *out_sheets = sheets;
+    *out_count  = count;
+    return true;
+
+fail:
+    for (size_t i = 0; i < count; i++) {
+        free(sheets[i].name);
+        free(sheets[i].rid);
+        free(sheets[i].target);
+    }
+    free(sheets);
+    return false;
+}
+
+// Parse xl/_rels/workbook.xml.rels and resolve each sheet's target zip path.
+// Targets in the rels are relative to xl/, so a Target="worksheets/sheet1.xml"
+// becomes the full zip path "xl/worksheets/sheet1.xml".
+static bool xlsx_resolve_sheet_targets(const uint8_t *rels_xml, size_t rels_len,
+                                       XlsxSheetMeta *sheets, size_t sheet_count) {
+    const char *p = (const char *)rels_xml;
+    const char *end = p + rels_len;
+
+    while (p < end) {
+        const char *open = xml_find_open_tag(p, end, "Relationship");
+        if (!open) break;
+        const char *attr_start = open + 13; // past "<Relationship"
+        bool sc;
+        const char *after = xml_skip_tag_open(attr_start, end, &sc);
+        const char *attr_end = sc ? after - 2 : after - 1;
+
+        const char *vs; size_t vl;
+        char *id = NULL, *target = NULL;
+        if (xml_get_attr(attr_start, attr_end, "Id", &vs, &vl))
+            id = xml_decode(vs, vl);
+        if (xml_get_attr(attr_start, attr_end, "Target", &vs, &vl))
+            target = xml_decode(vs, vl);
+
+        if (id && target) {
+            for (size_t i = 0; i < sheet_count; i++) {
+                if (sheets[i].rid && strcmp(sheets[i].rid, id) == 0) {
+                    // Resolve relative to xl/.
+                    // If target starts with '/', it's already absolute (drop leading '/').
+                    // Otherwise prepend "xl/".
+                    const char *t = target;
+                    if (t[0] == '/') {
+                        sheets[i].target = strdup(t + 1);
+                    } else {
+                        size_t tlen = strlen(t);
+                        sheets[i].target = malloc(3 + tlen + 1);
+                        if (sheets[i].target) {
+                            memcpy(sheets[i].target, "xl/", 3);
+                            memcpy(sheets[i].target + 3, t, tlen + 1);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        free(id);
+        free(target);
+        p = after;
+    }
+    return true;
+}
+
+// ---------------- xlsx_open / close ----------------
+
+static void xlsx_close(XlsxFile *xlsx) {
+    if (!xlsx) return;
+    if (xlsx->file_buf.data && xlsx->file_buf.is_mmap)
+        munmap(xlsx->file_buf.data, xlsx->file_buf.len);
+    for (size_t i = 0; i < xlsx->sst_count; i++) free(xlsx->shared_strings[i]);
+    free(xlsx->shared_strings);
+    for (size_t i = 0; i < xlsx->sheet_count; i++) {
+        free(xlsx->sheets[i].name);
+        free(xlsx->sheets[i].rid);
+        free(xlsx->sheets[i].target);
+    }
+    free(xlsx->sheets);
+    memset(xlsx, 0, sizeof(*xlsx));
+}
+
+static bool xlsx_open(const char *path, XlsxFile *out) {
+    memset(out, 0, sizeof(*out));
+    out->file_buf = buffer_load(path);
+    if (!out->file_buf.data) return false;
+
+    // workbook.xml
+    size_t wb_len = 0;
+    uint8_t *wb_xml = zip_read_entry(&out->file_buf, "xl/workbook.xml", &wb_len);
+    if (!wb_xml) { xlsx_close(out); return false; }
+
+    // workbook.xml.rels
+    size_t rels_len = 0;
+    uint8_t *rels_xml = zip_read_entry(&out->file_buf, "xl/_rels/workbook.xml.rels", &rels_len);
+
+    if (!xlsx_parse_workbook(wb_xml, wb_len, &out->sheets, &out->sheet_count)) {
+        free(wb_xml); free(rels_xml); xlsx_close(out); return false;
+    }
+    free(wb_xml);
+
+    if (rels_xml) {
+        xlsx_resolve_sheet_targets(rels_xml, rels_len, out->sheets, out->sheet_count);
+        free(rels_xml);
+    }
+
+    // Fall back: any sheet without a resolved target gets a heuristic guess.
+    for (size_t i = 0; i < out->sheet_count; i++) {
+        if (!out->sheets[i].target) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "xl/worksheets/sheet%zu.xml", i + 1);
+            out->sheets[i].target = strdup(buf);
+        }
+    }
+
+    // sharedStrings.xml (optional - some xlsx files have only inline strings)
+    size_t sst_len = 0;
+    uint8_t *sst_xml = zip_read_entry(&out->file_buf, "xl/sharedStrings.xml", &sst_len);
+    if (sst_xml) {
+        xlsx_parse_shared_strings(sst_xml, sst_len, &out->shared_strings, &out->sst_count);
+        free(sst_xml);
+    }
+
+    return true;
+}
+
+// ---------------- Sheet -> CSV materialization ----------------
+
+// Parse an xlsx cell reference like "A1", "AB123" -> column index (0-based).
+// On success returns true and writes the column index. Stops at the first
+// non-letter character (the row part is ignored here).
+static bool xlsx_cellref_col(const char *ref, size_t ref_len, uint32_t *out_col) {
+    uint32_t col = 0;
+    size_t i = 0;
+    while (i < ref_len) {
+        char c = ref[i];
+        if (c >= 'A' && c <= 'Z') { col = col * 26 + (uint32_t)(c - 'A' + 1); i++; }
+        else if (c >= 'a' && c <= 'z') { col = col * 26 + (uint32_t)(c - 'a' + 1); i++; }
+        else break;
+    }
+    if (col == 0) return false;
+    *out_col = col - 1;
+    return true;
+}
+
+typedef struct {
+    char  *data;
+    size_t len;
+    size_t cap;
+} CsvBuilder;
+
+static bool csvb_reserve(CsvBuilder *b, size_t need) {
+    if (b->len + need <= b->cap) return true;
+    size_t nc = b->cap ? b->cap * 2 : 4096;
+    while (nc < b->len + need) nc *= 2;
+    char *t = realloc(b->data, nc);
+    if (!t) return false;
+    b->data = t; b->cap = nc;
+    return true;
+}
+static bool csvb_append(CsvBuilder *b, const char *s, size_t n) {
+    if (!csvb_reserve(b, n)) return false;
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    return true;
+}
+static bool csvb_append_byte(CsvBuilder *b, char c) {
+    if (!csvb_reserve(b, 1)) return false;
+    b->data[b->len++] = c;
+    return true;
+}
+
+// Append a cell value with RFC 4180 quoting if needed.
+static bool csvb_append_cell(CsvBuilder *b, const char *val, size_t vlen) {
+    bool need_quote = false;
+    for (size_t i = 0; i < vlen; i++) {
+        char c = val[i];
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') { need_quote = true; break; }
+    }
+    if (!need_quote) return csvb_append(b, val, vlen);
+    if (!csvb_append_byte(b, '"')) return false;
+    for (size_t i = 0; i < vlen; i++) {
+        char c = val[i];
+        if (c == '"') { if (!csvb_append_byte(b, '"')) return false; }
+        if (!csvb_append_byte(b, c)) return false;
+    }
+    return csvb_append_byte(b, '"');
+}
+
+// Stream-parse a sheet XML, emitting a CSV row per <row>, with cells in column
+// order (gaps filled with empty cells, padded to `max_cols`).
+static bool xlsx_sheet_to_csv(XlsxFile *xlsx, const uint8_t *xml, size_t xml_len,
+                              CsvBuilder *out) {
+    const char *p = (const char *)xml;
+    const char *end = p + xml_len;
+
+    // First pass: find the maximum column index across all cells, so each row
+    // can be padded to the same number of columns. Cheap because we scan tags.
+    uint32_t max_col = 0;
+    {
+        const char *q = p;
+        while (q < end) {
+            const char *open = xml_find_open_tag(q, end, "c");
+            if (!open) break;
+            const char *attr_start = open + 2; // past "<c"
+            bool sc;
+            const char *after = xml_skip_tag_open(attr_start, end, &sc);
+            const char *attr_end = sc ? after - 2 : after - 1;
+            const char *rs; size_t rl;
+            uint32_t col = 0;
+            if (xml_get_attr(attr_start, attr_end, "r", &rs, &rl)) {
+                if (xlsx_cellref_col(rs, rl, &col)) {
+                    if (col > max_col) max_col = col;
+                }
+            }
+            q = after;
+        }
+    }
+    uint32_t ncols = max_col + 1;
+
+    // Second pass: walk <row>...</row>, emit CSV.
+    while (p < end) {
+        const char *row_open = xml_find_open_tag(p, end, "row");
+        if (!row_open) break;
+        bool sc;
+        const char *row_body = xml_skip_tag_open(row_open + 4, end, &sc);
+        // find </row>
+        const char *row_end = NULL;
+        const char *q = row_body;
+        while (q + 6 <= end) {
+            if (memcmp(q, "</row>", 6) == 0) { row_end = q; break; }
+            q++;
+        }
+        if (!row_end) break;
+
+        uint32_t cur_col = 0;
+        const char *cp = row_body;
+        while (cp < row_end) {
+            const char *c_open = xml_find_open_tag(cp, row_end, "c");
+            if (!c_open) break;
+            const char *attr_start = c_open + 2;
+            const char *after = xml_skip_tag_open(attr_start, row_end, &sc);
+            const char *attr_end = sc ? after - 2 : after - 1;
+
+            // column index from r="A1"; if missing, use cur_col
+            uint32_t col = cur_col;
+            const char *rs; size_t rl;
+            if (xml_get_attr(attr_start, attr_end, "r", &rs, &rl)) {
+                xlsx_cellref_col(rs, rl, &col);
+            }
+            // Pad missing columns with empty cells
+            while (cur_col < col) {
+                if (cur_col > 0) {
+                    if (!csvb_append_byte(out, ',')) return false;
+                }
+                cur_col++;
+            }
+            if (cur_col > 0) {
+                if (!csvb_append_byte(out, ',')) return false;
+            }
+
+            // Type attr
+            const char *ts; size_t tl;
+            char type = 'n'; // default: number
+            if (xml_get_attr(attr_start, attr_end, "t", &ts, &tl)) {
+                if (tl > 0) type = ts[0];
+            }
+
+            // Find the cell's body (between this opening tag and the matching </c>).
+            const char *c_body_end = NULL;
+            if (!sc) {
+                const char *qq = after;
+                while (qq + 4 <= row_end) {
+                    if (memcmp(qq, "</c>", 4) == 0) { c_body_end = qq; break; }
+                    qq++;
+                }
+            }
+
+            // Value extraction
+            char *value = NULL;
+            size_t value_len = 0;
+
+            if (sc || !c_body_end) {
+                // empty cell
+                value = strdup("");
+                if (!value) return false;
+            } else if (type == 'i' /* inlineStr */) {
+                const char *tstart; size_t tlen;
+                if (xml_next_t_text(after, c_body_end, &tstart, &tlen)) {
+                    value = xml_decode(tstart, tlen);
+                    if (!value) return false;
+                    value_len = strlen(value);
+                } else { value = strdup(""); if (!value) return false; }
+            } else {
+                // Find <v>...</v>
+                const char *v_open = xml_find_open_tag(after, c_body_end, "v");
+                if (v_open) {
+                    bool vs2;
+                    const char *v_body = xml_skip_tag_open(v_open + 2, c_body_end, &vs2);
+                    const char *v_end = NULL;
+                    const char *qq = v_body;
+                    while (qq + 4 <= c_body_end) {
+                        if (memcmp(qq, "</v>", 4) == 0) { v_end = qq; break; }
+                        qq++;
+                    }
+                    if (v_end) {
+                        if (type == 's') {
+                            // shared string index
+                            char idxbuf[32];
+                            size_t cl = (size_t)(v_end - v_body);
+                            if (cl >= sizeof(idxbuf)) cl = sizeof(idxbuf) - 1;
+                            memcpy(idxbuf, v_body, cl); idxbuf[cl] = '\0';
+                            long idx = strtol(idxbuf, NULL, 10);
+                            if (idx >= 0 && (size_t)idx < xlsx->sst_count) {
+                                value = strdup(xlsx->shared_strings[idx]);
+                            } else {
+                                value = strdup("");
+                            }
+                            if (!value) return false;
+                            value_len = strlen(value);
+                        } else if (type == 'b') {
+                            value = strdup((v_end > v_body && v_body[0] == '1') ? "TRUE" : "FALSE");
+                            if (!value) return false;
+                            value_len = strlen(value);
+                        } else {
+                            // number, str, date — pass through with entity decode
+                            value = xml_decode(v_body, (size_t)(v_end - v_body));
+                            if (!value) return false;
+                            value_len = strlen(value);
+                        }
+                    }
+                }
+                if (!value) { value = strdup(""); if (!value) return false; }
+            }
+
+            if (!csvb_append_cell(out, value, value_len)) { free(value); return false; }
+            free(value);
+
+            cur_col = col + 1;
+            cp = sc ? after : (c_body_end + 4);
+        }
+        // pad row to ncols
+        while (cur_col < ncols) {
+            if (cur_col > 0) {
+                if (!csvb_append_byte(out, ',')) return false;
+            }
+            cur_col++;
+        }
+        if (!csvb_append_byte(out, '\n')) return false;
+
+        p = row_end + 6;
+    }
+    return true;
+}
+
+// Public: load sheet `i` from xlsx as a malloc'd CSV byte buffer (RFC 4180,
+// comma-delimited, LF row separator). Caller takes ownership of out_buf->data.
+static bool xlsx_load_sheet_as_csv(XlsxFile *xlsx, size_t sheet_index, Buffer *out_buf) {
+    memset(out_buf, 0, sizeof(*out_buf));
+    if (sheet_index >= xlsx->sheet_count) return false;
+    const char *target = xlsx->sheets[sheet_index].target;
+    if (!target) return false;
+
+    size_t xml_len = 0;
+    uint8_t *xml = zip_read_entry(&xlsx->file_buf, target, &xml_len);
+    if (!xml) return false;
+
+    CsvBuilder b = {0};
+    bool ok = xlsx_sheet_to_csv(xlsx, xml, xml_len, &b);
+    free(xml);
+    if (!ok) { free(b.data); return false; }
+
+    out_buf->data    = b.data;
+    out_buf->len     = b.len;
+    out_buf->is_mmap = false;
+    return true;
+}
+
+// Build a synthetic 1-column CSV buffer listing the sheet names. Header is
+// included so it shows up in the sheet-list pane.
+static bool xlsx_build_sheet_list_csv(XlsxFile *xlsx, Buffer *out_buf) {
+    memset(out_buf, 0, sizeof(*out_buf));
+    CsvBuilder b = {0};
+    static const char hdr[] = "Sheet\n";
+    if (!csvb_append(&b, hdr, sizeof(hdr) - 1)) { free(b.data); return false; }
+    for (size_t i = 0; i < xlsx->sheet_count; i++) {
+        const char *n = xlsx->sheets[i].name ? xlsx->sheets[i].name : "";
+        if (!csvb_append_cell(&b, n, strlen(n))) { free(b.data); return false; }
+        if (!csvb_append_byte(&b, '\n')) { free(b.data); return false; }
+    }
+    out_buf->data    = b.data;
+    out_buf->len     = b.len;
+    out_buf->is_mmap = false;
+    return true;
+}
+
+// ============================================================================
+// End of XLSX Reader
+// ============================================================================
+// ============================================================================
 // CellValue Structure (Extended for Frequency Panes)
 // ============================================================================
 
@@ -277,16 +1535,27 @@ typedef struct FreqRow {
 // Pane Structure
 // ============================================================================
 
+typedef enum {
+    PANE_CSV,
+    PANE_FREQ,
+    PANE_SHEET_LIST,
+} PaneKind;
+
 typedef struct Pane {
-    // === Row identity (mutually exclusive modes) ===
-    // CSV pane: row_ids maps base_index -> global row_id
-    size_t *row_ids;        // NULL for main pane (base_index == row_id)
+    PaneKind kind;
+
+    // === Data source for PANE_CSV / PANE_SHEET_LIST: non-owning (TUI csv registry owns) ===
+    ParsedCSV *csv;
+    int       *col_widths;    // owned: malloc'd in pane_init_csv
+    uint16_t   num_cols;
+
+    // === Row identity (CSV pane: row_ids maps base_index -> global row_id) ===
+    size_t *row_ids;        // NULL for primary pane (base_index == row_id)
     size_t  row_id_count;   // Count when row_ids != NULL
 
-    // Frequency pane: freq_rows is the data source
-    FreqRow *freq_rows;     // NULL for CSV panes
+    // === Frequency pane data (PANE_FREQ only) ===
+    FreqRow *freq_rows;     // NULL for non-freq panes
     size_t   freq_row_count;
-    bool     is_freq_pane;
     uint16_t freq_source_col;     // Source column index (for status display)
     int      freq_col_widths[3];  // [0]=value (expandable), [1]=count (fixed), [2]=percent (fixed)
 
@@ -337,7 +1606,6 @@ typedef struct Pane {
 #define COL_SEP_LEN 3
 
 typedef struct {
-    ParsedCSV *csv;
     bool has_header;
 
     // Terminal
@@ -345,9 +1613,15 @@ typedef struct {
     int term_cols;
     struct termios orig_termios;
 
-    // Column widths (shared across panes)
-    int *col_widths;
-    uint16_t num_cols;
+    // Owned ParsedCSV registry. Each pane points to one of these (non-owning).
+    // Allocated heap-stable so pane->csv pointers survive registry growth.
+    ParsedCSV **csvs;
+    size_t      csv_count;
+    size_t      csv_cap;
+
+    // For .xlsx files: owned (heap-allocated). NULL for plain CSV files. The
+    // sheet-list pane references this on Enter to materialize the chosen sheet.
+    XlsxFile   *xlsx;
 
     // Panes
     Pane  *panes;
@@ -362,38 +1636,66 @@ typedef struct {
 // Forward Declarations
 // ============================================================================
 
-static size_t tui_data_row_count(TUI *tui);
-static size_t tui_csv_row(TUI *tui, size_t row_id);
-static CellValue tui_get_cell_value(TUI *tui, size_t csv_row, uint16_t col);
+static CellValue csv_get_cell_value(ParsedCSV *csv, size_t csv_row, uint16_t col);
+
+static inline size_t csv_data_row_count(const ParsedCSV *csv, bool has_header) {
+    if (!csv || csv->row_count == 0) return 0;
+    return has_header ? csv->row_count - 1 : csv->row_count;
+}
+
+static inline size_t csv_to_csv_row(size_t row_id, bool has_header) {
+    return has_header ? row_id + 1 : row_id;
+}
+
+// Registers a ParsedCSV with the TUI (TUI takes ownership). Returns a heap-stable
+// pointer that callers may store on a Pane. Returns NULL on alloc failure (caller
+// should free the input csv themselves in that case).
+static ParsedCSV *tui_register_csv(TUI *tui, ParsedCSV csv_value);
 
 // ============================================================================
 // Pane Functions
 // ============================================================================
 
 // Initialize a CSV-backed pane
-// row_ids: NULL for main pane, or owned array of global row_ids (caller transfers ownership)
+// csv: pane's data source (registered with the TUI; non-owning)
+// row_ids: NULL for primary pane, or owned array of global row_ids (caller transfers ownership)
 // count: number of rows (ignored if row_ids==NULL)
-static void pane_init_csv(Pane *p, TUI *tui, size_t *row_ids, size_t count) {
+// kind: typically PANE_CSV; pass PANE_SHEET_LIST for the xlsx sheet-list pane.
+static bool pane_init_csv(Pane *p, TUI *tui, ParsedCSV *csv,
+        size_t *row_ids, size_t count, PaneKind kind) {
     memset(p, 0, sizeof(Pane));
+    p->kind = kind;
+    p->csv = csv;
+    p->num_cols = csv ? csv->max_cols : 0;
     p->row_ids = row_ids;
     p->row_id_count = count;
-    p->is_freq_pane = false;
     p->freq_rows = NULL;
     p->parent_csv_pane = -1;
 
-    // Determine pane row count for selection bitmap sizing
-    size_t pane_rows;
-    if (row_ids == NULL) {
-        pane_rows = tui_data_row_count(tui);
-    } else {
-        pane_rows = count;
+    // Per-pane column widths
+    if (p->num_cols > 0) {
+        p->col_widths = malloc(p->num_cols * sizeof(int));
+        if (!p->col_widths) return false;
+        for (uint16_t i = 0; i < p->num_cols; i++) {
+            p->col_widths[i] = DEFAULT_COL_WIDTH;
+        }
     }
 
-    // Selection bitmap sized to base_index domain
+    // Determine pane row count for selection bitmap sizing
+    size_t pane_rows = (row_ids == NULL)
+        ? csv_data_row_count(csv, tui->has_header)
+        : count;
+
     p->selection_bytes = (pane_rows + 7) / 8;
     if (p->selection_bytes > 0) {
         p->selection_bitmap = calloc(p->selection_bytes, 1);
+        if (!p->selection_bitmap) {
+            free(p->col_widths);
+            p->col_widths = NULL;
+            return false;
+        }
     }
+    return true;
 }
 
 // Initialize a frequency pane
@@ -402,9 +1704,12 @@ static void pane_init_csv(Pane *p, TUI *tui, size_t *row_ids, size_t count) {
 // source_col: original CSV column index (for status display)
 static void pane_init_freq(Pane *p, FreqRow *freq_rows, size_t count, uint16_t source_col, int parent_csv_pane) {
     memset(p, 0, sizeof(Pane));
+    p->kind = PANE_FREQ;
+    p->csv = NULL;
+    p->col_widths = NULL;
+    p->num_cols = 3;
     p->freq_rows = freq_rows;
     p->freq_row_count = count;
-    p->is_freq_pane = true;
     p->freq_source_col = source_col;
     p->row_ids = NULL;
     p->row_id_count = 0;
@@ -426,6 +1731,7 @@ static void pane_free(Pane *p) {
     free(p->row_ids);
     free(p->selection_bitmap);
     free(p->sort_index);
+    free(p->col_widths);
 
     // Free frequency data
     if (p->freq_rows) {
@@ -439,11 +1745,11 @@ static void pane_free(Pane *p) {
 }
 
 static size_t pane_row_count(TUI *tui, Pane *p) {
-    if (p->is_freq_pane) {
+    if (p->kind == PANE_FREQ) {
         return p->freq_row_count;
     }
     if (p->row_ids == NULL) {
-        return tui_data_row_count(tui);
+        return csv_data_row_count(p->csv, tui->has_header);
     }
     return p->row_id_count;
 }
@@ -459,22 +1765,21 @@ static size_t pane_display_to_base_index(Pane *p, size_t display_row) {
 
 // Returns number of columns for this pane
 static uint16_t pane_num_cols(TUI *tui, Pane *p) {
-    if (p->is_freq_pane) {
-        return 3;
-    }
-    return tui->num_cols;
+    (void)tui;
+    return p->num_cols;
 }
 
 // Returns column width for given column
 static int pane_col_width(TUI *tui, Pane *p, uint16_t col) {
-    if (p->is_freq_pane) {
+    (void)tui;
+    if (p->kind == PANE_FREQ) {
         if (col < 3) {
             return p->freq_col_widths[col];
         }
         return 0;
     }
-    if (col < tui->num_cols) {
-        return tui->col_widths[col];
+    if (p->col_widths && col < p->num_cols) {
+        return p->col_widths[col];
     }
     return 0;
 }
@@ -489,7 +1794,7 @@ static int pane_col_width(TUI *tui, Pane *p, uint16_t col) {
 // FreqRow.value stores the full string; only rendering truncates.
 static size_t pane_get_cell_text(TUI *tui, Pane *p, size_t base_index,
         uint16_t col, char *buf, size_t buf_len) {
-    if (p->is_freq_pane) {
+    if (p->kind == PANE_FREQ) {
         if (base_index >= p->freq_row_count || col > 2) {
             return 0;
         }
@@ -511,16 +1816,17 @@ static size_t pane_get_cell_text(TUI *tui, Pane *p, size_t base_index,
         return 0;
     }
 
-    // CSV pane: derive row_id internally, decode from CellRef
+    // CSV / sheet-list pane: derive row_id internally, decode from CellRef
+    if (!p->csv) return 0;
     size_t row_id = (p->row_ids != NULL) ? p->row_ids[base_index] : base_index;
-    size_t csv_row = tui_csv_row(tui, row_id);
-    const CellRef *cell = parsed_csv_get_cell(tui->csv, csv_row, col);
+    size_t csv_row = csv_to_csv_row(row_id, tui->has_header);
+    const CellRef *cell = parsed_csv_get_cell(p->csv, csv_row, col);
 
     if (!cell || cell->len == 0) {
         return 0;
     }
 
-    return cell_decode(tui->csv, cell, buf, buf_len);
+    return cell_decode(p->csv, cell, buf, buf_len);
 }
 
 // Get cell value for sorting and searching
@@ -529,7 +1835,7 @@ static size_t pane_get_cell_text(TUI *tui, Pane *p, size_t base_index,
 static CellValue pane_get_cell_value(TUI *tui, Pane *p, size_t base_index, uint16_t col) {
     CellValue val = {0};
 
-    if (p->is_freq_pane) {
+    if (p->kind == PANE_FREQ) {
         if (base_index >= p->freq_row_count || col > 2) {
             val.is_empty = true;
             return val;
@@ -566,10 +1872,14 @@ static CellValue pane_get_cell_value(TUI *tui, Pane *p, size_t base_index, uint1
         return val;
     }
 
-    // CSV pane: derive row_id internally, use existing tui_get_cell_value
+    // CSV / sheet-list pane: derive row_id internally
+    if (!p->csv) {
+        val.is_empty = true;
+        return val;
+    }
     size_t row_id = (p->row_ids != NULL) ? p->row_ids[base_index] : base_index;
-    size_t csv_row = tui_csv_row(tui, row_id);
-    return tui_get_cell_value(tui, csv_row, col);
+    size_t csv_row = csv_to_csv_row(row_id, tui->has_header);
+    return csv_get_cell_value(p->csv, csv_row, col);
 }
 
 // All selection operations use base_index (pane-local unsorted index)
@@ -703,7 +2013,7 @@ static void tui_get_size(TUI *tui) {
 
 // Returns 1 if this pane will draw a header row, 0 otherwise
 static int tui_header_rows(TUI *tui, Pane *pane) {
-    return (tui->has_header && !pane->is_freq_pane) ? 1 : 0;
+    return (tui->has_header && pane->kind != PANE_FREQ) ? 1 : 0;
 }
 
 // Returns number of visible data rows for this pane
@@ -713,31 +2023,22 @@ static int tui_visible_data_rows(TUI *tui, Pane *pane) {
     return rows > 0 ? rows : 1;
 }
 
-static size_t tui_data_row_count(TUI *tui) {
-    if (tui->csv->row_count == 0) return 0;
-    return tui->has_header ? tui->csv->row_count - 1 : tui->csv->row_count;
-}
-
-static size_t tui_csv_row(TUI *tui, size_t row_id) {
-    return tui->has_header ? row_id + 1 : row_id;
-}
-
-static CellValue tui_get_cell_value(TUI *tui, size_t csv_row, uint16_t col) {
+static CellValue csv_get_cell_value(ParsedCSV *csv, size_t csv_row, uint16_t col) {
     CellValue val = {0};
-    const CellRef *cell = parsed_csv_get_cell(tui->csv, csv_row, col);
+    const CellRef *cell = parsed_csv_get_cell(csv, csv_row, col);
     if (!cell || cell->len == 0) {
         val.is_empty = true;
         return val;
     }
 
-    const char *src = tui->csv->buf.data + cell->offset;
+    const char *src = csv->buf.data + cell->offset;
     size_t src_len = cell->len;
 
     if (!(cell->flags & FLAG_NEEDS_DECODE)) {
         val.str_len = src_len < sizeof(val.str) - 1 ? src_len : sizeof(val.str) - 1;
         memcpy(val.str, src, val.str_len);
     } else {
-        val.str_len = cell_decode(tui->csv, cell, val.str, sizeof(val.str) - 1);
+        val.str_len = cell_decode(csv, cell, val.str, sizeof(val.str) - 1);
         if (val.str_len >= sizeof(val.str)) val.str_len = sizeof(val.str) - 1;
     }
     val.str[val.str_len] = '\0';
@@ -751,52 +2052,75 @@ static CellValue tui_get_cell_value(TUI *tui, size_t csv_row, uint16_t col) {
     return val;
 }
 
-static void tui_autofit_initial_widths(TUI *tui) {
-    if (!tui || tui->num_cols == 0) return;
+static ParsedCSV *tui_register_csv(TUI *tui, ParsedCSV csv_value) {
+    if (tui->csv_count >= tui->csv_cap) {
+        size_t new_cap = tui->csv_cap ? tui->csv_cap * 2 : 4;
+        ParsedCSV **new_csvs = realloc(tui->csvs, new_cap * sizeof(ParsedCSV*));
+        if (!new_csvs) return NULL;
+        tui->csvs = new_csvs;
+        tui->csv_cap = new_cap;
+    }
+    ParsedCSV *heap = malloc(sizeof(ParsedCSV));
+    if (!heap) return NULL;
+    *heap = csv_value;
+    tui->csvs[tui->csv_count++] = heap;
+    return heap;
+}
+
+static void tui_free_csvs(TUI *tui) {
+    for (size_t i = 0; i < tui->csv_count; i++) {
+        parsed_csv_free(tui->csvs[i]);
+        free(tui->csvs[i]);
+    }
+    free(tui->csvs);
+    tui->csvs = NULL;
+    tui->csv_count = 0;
+    tui->csv_cap = 0;
+}
+
+static void pane_autofit_initial_widths(TUI *tui, Pane *p) {
+    if (!tui || !p || p->kind == PANE_FREQ) return;
+    if (!p->csv || p->num_cols == 0 || !p->col_widths) return;
 
     // Use current terminal size
     tui_get_size(tui);
 
-    Pane *mainp = &tui->panes[0];
-
-    // How many data rows are visible on screen for main pane
-    int visible_rows = tui_visible_data_rows(tui, mainp);
+    int visible_rows = tui_visible_data_rows(tui, p);
     if (visible_rows < 1) visible_rows = 1;
 
-    for (uint16_t col = 0; col < tui->num_cols; col++) {
+    for (uint16_t col = 0; col < p->num_cols; col++) {
         int maxw = 1;
 
         // header width if present
-        if (tui->has_header && tui->csv->row_count > 0) {
-            const CellRef *hc = parsed_csv_get_cell(tui->csv, 0, col);
+        if (tui->has_header && p->csv->row_count > 0) {
+            const CellRef *hc = parsed_csv_get_cell(p->csv, 0, col);
             if (hc) {
-                size_t hl = cell_decode(tui->csv, hc, NULL, 0);
+                size_t hl = cell_decode(p->csv, hc, NULL, 0);
                 if (hl > MAX_COL_WIDTH) hl = MAX_COL_WIDTH;
                 if ((int)hl > maxw) maxw = (int)hl;
             }
         }
 
-        // first screenful of data rows (pane 0 is unsorted initially)
-        size_t total_rows = pane_row_count(tui, mainp);
+        // first screenful of data rows (initial pane is unsorted)
+        size_t total_rows = pane_row_count(tui, p);
         int rows_to_scan = visible_rows;
         if ((size_t)rows_to_scan > total_rows) rows_to_scan = (int)total_rows;
 
         for (int r = 0; r < rows_to_scan; r++) {
-            size_t row_id = (mainp->row_ids != NULL) ? mainp->row_ids[r] : (size_t)r;
-            size_t csv_row = tui_csv_row(tui, row_id);
-            const CellRef *cell = parsed_csv_get_cell(tui->csv, csv_row, col);
+            size_t row_id = (p->row_ids != NULL) ? p->row_ids[r] : (size_t)r;
+            size_t csv_row = csv_to_csv_row(row_id, tui->has_header);
+            const CellRef *cell = parsed_csv_get_cell(p->csv, csv_row, col);
             if (!cell) continue;
 
-            size_t dl = cell_decode(tui->csv, cell, NULL, 0);
+            size_t dl = cell_decode(p->csv, cell, NULL, 0);
             if (dl > MAX_COL_WIDTH) dl = MAX_COL_WIDTH;
             if ((int)dl > maxw) maxw = (int)dl;
         }
 
-        // Clamp: start tight, but don't exceed DEFAULT_COL_WIDTH on init
         if (maxw < 1) maxw = 1;
         if (maxw > DEFAULT_COL_WIDTH) maxw = DEFAULT_COL_WIDTH;
 
-        tui->col_widths[col] = maxw;
+        p->col_widths[col] = maxw;
     }
 }
 
@@ -1018,7 +2342,7 @@ static bool pane_search(TUI *tui, Pane *pane, bool forward) {
 // ============================================================================
 
 static void pane_expand_column(TUI *tui, Pane *pane) {
-    if (pane->is_freq_pane) {
+    if (pane->kind == PANE_FREQ) {
         // Only value column (0) is expandable; count (1) and percent (2) are fixed
         if (pane->cur_col != 0) return;
 
@@ -1045,12 +2369,13 @@ static void pane_expand_column(TUI *tui, Pane *pane) {
         return;
     }
 
-    // CSV pane: existing logic
+    // CSV / sheet-list pane
+    if (!pane->csv || !pane->col_widths || pane->cur_col >= pane->num_cols) return;
     int max_width = 0;
 
     // Check header if present
-    if (tui->has_header && tui->csv->row_count > 0) {
-        const CellRef *cell = parsed_csv_get_cell(tui->csv, 0, pane->cur_col);
+    if (tui->has_header && pane->csv->row_count > 0) {
+        const CellRef *cell = parsed_csv_get_cell(pane->csv, 0, pane->cur_col);
         if (cell && (int)cell->len > max_width) max_width = cell->len;
     }
 
@@ -1064,20 +2389,20 @@ static void pane_expand_column(TUI *tui, Pane *pane) {
 
         size_t base_index = pane_display_to_base_index(pane, display_row);
         size_t row_id = (pane->row_ids != NULL) ? pane->row_ids[base_index] : base_index;
-        size_t csv_row = tui_csv_row(tui, row_id);
+        size_t csv_row = csv_to_csv_row(row_id, tui->has_header);
 
-        const CellRef *cell = parsed_csv_get_cell(tui->csv, csv_row, pane->cur_col);
+        const CellRef *cell = parsed_csv_get_cell(pane->csv, csv_row, pane->cur_col);
         if (cell) {
             char tmp[MAX_COL_WIDTH + 1];
-            size_t decoded_len = cell_decode(tui->csv, cell, tmp, MAX_COL_WIDTH);
+            size_t decoded_len = cell_decode(pane->csv, cell, tmp, MAX_COL_WIDTH);
             if ((int)decoded_len > max_width) max_width = (int)decoded_len;
         }
     }
 
     if (max_width > MAX_COL_WIDTH) max_width = MAX_COL_WIDTH;
     if (max_width < 1) max_width = 1;
-    if (max_width > tui->col_widths[pane->cur_col]) {
-        tui->col_widths[pane->cur_col] = max_width;
+    if (max_width > pane->col_widths[pane->cur_col]) {
+        pane->col_widths[pane->cur_col] = max_width;
     }
 }
 
@@ -1245,9 +2570,10 @@ static FreqRow *build_frequency_table(TUI *tui, Pane *src_pane, uint16_t col,
     *out_count = 0;
 
     // Guard: cannot build frequency from frequency pane
-    if (src_pane->is_freq_pane) {
+    if (src_pane->kind == PANE_FREQ) {
         return NULL;
     }
+    if (!src_pane->csv) return NULL;
 
     size_t pane_rows = pane_row_count(tui, src_pane);
     if (pane_rows == 0) {
@@ -1269,8 +2595,8 @@ static FreqRow *build_frequency_table(TUI *tui, Pane *src_pane, uint16_t col,
     for (size_t bi = 0; bi < pane_rows; bi++) {
         // Derive row_id internally (no pane_display_to_row_id helper)
         size_t row_id = (src_pane->row_ids != NULL) ? src_pane->row_ids[bi] : bi;
-        size_t csv_row = tui_csv_row(tui, row_id);
-        const CellRef *cell = parsed_csv_get_cell(tui->csv, csv_row, col);
+        size_t csv_row = csv_to_csv_row(row_id, tui->has_header);
+        const CellRef *cell = parsed_csv_get_cell(src_pane->csv, csv_row, col);
 
         if (!cell) {
             // Missing column -> NULL
@@ -1297,7 +2623,7 @@ static FreqRow *build_frequency_table(TUI *tui, Pane *src_pane, uint16_t col,
 
 
         // Get exact decoded length using cell_decode with NULL buffer
-        size_t decoded_len = cell_decode(tui->csv, cell, NULL, 0);
+        size_t decoded_len = cell_decode(src_pane->csv, cell, NULL, 0);
 
         // Apply explicit per-key cap
         if (decoded_len > FREQ_MAP_MAX_KEY_LEN) {
@@ -1320,7 +2646,7 @@ static FreqRow *build_frequency_table(TUI *tui, Pane *src_pane, uint16_t col,
         }
 
         // Decode into scratch buffer (pass decoded_len + 1 for NUL space)
-        size_t actual_len = cell_decode(tui->csv, cell, scratch, decoded_len + 1);
+        size_t actual_len = cell_decode(src_pane->csv, cell, scratch, decoded_len + 1);
         if (actual_len > decoded_len) actual_len = decoded_len;  // Respect cap
         scratch[actual_len] = '\0';
 
@@ -1365,7 +2691,8 @@ static void select_rows_in_main_matching_freq_key(TUI *tui, uint16_t source_col,
 
     // "Main data view" = pane 0
     Pane *mainp = &tui->panes[0];
-    if (mainp->is_freq_pane) return; // should never happen
+    if (mainp->kind == PANE_FREQ) return; // should never happen
+    if (!mainp->csv) return;
 
     // Reusable scratch for decoded cell
     char *scratch = NULL;
@@ -1376,8 +2703,8 @@ static void select_rows_in_main_matching_freq_key(TUI *tui, uint16_t source_col,
     size_t pane_rows = pane_row_count(tui, mainp);
     for (size_t bi = 0; bi < pane_rows; bi++) {
         size_t row_id = (mainp->row_ids != NULL) ? mainp->row_ids[bi] : bi;
-        size_t csv_row = tui_csv_row(tui, row_id);
-        const CellRef *cell = parsed_csv_get_cell(tui->csv, csv_row, source_col);
+        size_t csv_row = csv_to_csv_row(row_id, tui->has_header);
+        const CellRef *cell = parsed_csv_get_cell(mainp->csv, csv_row, source_col);
 
         bool match = false;
 
@@ -1388,7 +2715,7 @@ static void select_rows_in_main_matching_freq_key(TUI *tui, uint16_t source_col,
             match = (key_len == 0);
         } else {
             // Match the same truncation rule used by frequency build
-            size_t decoded_len = cell_decode(tui->csv, cell, NULL, 0);
+            size_t decoded_len = cell_decode(mainp->csv, cell, NULL, 0);
             if (decoded_len > FREQ_MAP_MAX_KEY_LEN) decoded_len = FREQ_MAP_MAX_KEY_LEN;
 
             if (decoded_len == key_len) {
@@ -1402,7 +2729,7 @@ static void select_rows_in_main_matching_freq_key(TUI *tui, uint16_t source_col,
                     scratch_cap = new_cap;
                 }
 
-                size_t actual_len = cell_decode(tui->csv, cell, scratch, decoded_len + 1);
+                size_t actual_len = cell_decode(mainp->csv, cell, scratch, decoded_len + 1);
                 if (actual_len > decoded_len) actual_len = decoded_len;
                 scratch[actual_len] = '\0';
 
@@ -1436,14 +2763,14 @@ static void select_rows_in_main_matching_freq_key(TUI *tui, uint16_t source_col,
 
 // Write cell content to buffer for CSV headers (row 0 direct access)
 // This is an intentional exception: headers render directly from CSV row 0
-static int write_cell(TUI *tui, char *buf, int buf_len, size_t row, uint16_t col, int width) {
-    const CellRef *cell = parsed_csv_get_cell(tui->csv, row, col);
+static int write_cell(ParsedCSV *csv, char *buf, int buf_len, size_t row, uint16_t col, int width) {
+    const CellRef *cell = parsed_csv_get_cell(csv, row, col);
 
     char decoded[MAX_COL_WIDTH + 1];
     size_t decoded_len = 0;
 
     if (cell) {
-        decoded_len = cell_decode(tui->csv, cell, decoded, MAX_COL_WIDTH);
+        decoded_len = cell_decode(csv, cell, decoded, MAX_COL_WIDTH);
         if (decoded_len > MAX_COL_WIDTH) decoded_len = MAX_COL_WIDTH;
     }
 
@@ -1501,9 +2828,9 @@ static void tui_draw(TUI *tui) {
     bool has_more_left = pane->view_left > 0;
     bool has_more_right = false;
 
-    // Draw header if present (CSV panes with headers only)
+    // Draw header if present (CSV / sheet-list panes with headers only)
     // NOTE: write_cell() is used here intentionally - headers access CSV row 0 directly
-    if (!pane->is_freq_pane && tui->has_header && tui->csv->row_count > 0) {
+    if (pane->kind != PANE_FREQ && tui->has_header && pane->csv && pane->csv->row_count > 0) {
         pos += snprintf(buf + pos, sizeof(buf) - pos, "\x1b[1;7m");
 
         int x = 0;
@@ -1528,7 +2855,7 @@ static void tui_draw(TUI *tui) {
 
             if (w > 0) {
                 // Header uses write_cell() with CSV row 0 directly
-                pos += write_cell(tui, buf + pos, sizeof(buf) - pos, 0, c, w);
+                pos += write_cell(pane->csv, buf + pos, sizeof(buf) - pos, 0, c, w);
                 x += w;
             }
             last_col_drawn = c;
@@ -1623,7 +2950,7 @@ static void tui_draw(TUI *tui) {
         status_len = snprintf(status_tmp, sizeof(status_tmp), "c/%s", pane->col_search_buf);
     } else if (pane->search_active) {
         status_len = snprintf(status_tmp, sizeof(status_tmp), "/%s", pane->search_buf);
-    } else if (pane->is_freq_pane) {
+    } else if (pane->kind == PANE_FREQ) {
         size_t selected = pane_count_selected(tui, pane);
         status_len = snprintf(status_tmp, sizeof(status_tmp),
                 " Pane %zu/%zu [Freq col %u]  Sel %zu  Row %zu/%zu  Col %u/3 ",
@@ -1889,14 +3216,14 @@ static void tui_process_key(TUI *tui, int key) {
             pane->col_search_buf[0] = '\0';
         } else if (key == '\r' || key == '\n') {
             pane->col_search_active = false;
-            if (pane->col_search_len > 0 && tui->has_header && !pane->is_freq_pane
-                    && tui->csv->row_count > 0) {
+            if (pane->col_search_len > 0 && tui->has_header && pane->kind != PANE_FREQ
+                    && pane->csv && pane->csv->row_count > 0) {
                 // Search column headers for a case-insensitive substring match
-                for (uint16_t c = 0; c < tui->num_cols; c++) {
-                    const CellRef *hc = parsed_csv_get_cell(tui->csv, 0, c);
+                for (uint16_t c = 0; c < pane->num_cols; c++) {
+                    const CellRef *hc = parsed_csv_get_cell(pane->csv, 0, c);
                     if (!hc) continue;
                     char hdr[MAX_COL_WIDTH + 1];
-                    size_t hdr_len = cell_decode(tui->csv, hc, hdr, MAX_COL_WIDTH);
+                    size_t hdr_len = cell_decode(pane->csv, hc, hdr, MAX_COL_WIDTH);
                     if (hdr_len > MAX_COL_WIDTH) hdr_len = MAX_COL_WIDTH;
                     hdr[hdr_len] = '\0';
                     if (strcasestr(hdr, pane->col_search_buf) != NULL) {
@@ -1941,7 +3268,7 @@ static void tui_process_key(TUI *tui, int key) {
                 size_t base_index = pane_display_to_base_index(pane, pane->cur_row);
                 pane_select(pane, base_index);
 
-                if (pane->is_freq_pane && base_index < pane->freq_row_count) {
+                if (pane->kind == PANE_FREQ && base_index < pane->freq_row_count) {
                     FreqRow *fr = &pane->freq_rows[base_index];
                     // Select matching rows in main data view (pane 0)
                     select_rows_in_main_matching_freq_key(tui, pane->freq_source_col, fr->value, fr->value_len);
@@ -1972,7 +3299,7 @@ static void tui_process_key(TUI *tui, int key) {
                 }
                 if (selected_count == 0) break;
 
-                if (pane->is_freq_pane) {
+                if (pane->kind == PANE_FREQ) {
                     // Split frequency pane: deep copy selected FreqRows
                     FreqRow *new_freq = malloc(selected_count * sizeof(FreqRow));
                     if (!new_freq) break;
@@ -2028,7 +3355,11 @@ static void tui_process_key(TUI *tui, int key) {
                         break;
                     }
 
-                    pane_init_csv(new_pane, tui, new_row_ids, selected_count);
+                    if (!pane_init_csv(new_pane, tui, pane->csv, new_row_ids, selected_count, PANE_CSV)) {
+                        free(new_row_ids);
+                        tui->pane_count--;
+                        break;
+                    }
                     tui->active_pane = tui->pane_count - 1;
                 }
             }
@@ -2036,7 +3367,7 @@ static void tui_process_key(TUI *tui, int key) {
 
         case 'f':  // Frequency analysis for current column
                    // No recursion: f is no-op on frequency panes
-            if (pane->is_freq_pane) {
+            if (pane->kind == PANE_FREQ) {
                 break;
             }
             {
@@ -2138,7 +3469,7 @@ static void tui_process_key(TUI *tui, int key) {
             break;
 
         case 'c':  // column search
-            if (!pane->is_freq_pane && tui->has_header) {
+            if (pane->kind != PANE_FREQ && tui->has_header) {
                 pane->col_search_active = true;
                 pane->col_search_len = 0;
                 pane->col_search_buf[0] = '\0';
@@ -2161,6 +3492,52 @@ static void tui_process_key(TUI *tui, int key) {
         case 'N':  // previous match
             if (pane->search_has_query) {
                 pane_search(tui, pane, false);
+            }
+            break;
+
+        case '\r':  // Enter
+        case '\n':
+            if (pane->kind == PANE_SHEET_LIST && tui->xlsx && pane_rows > 0) {
+                // Read the selected sheet name from cell (cur_row, 0).
+                size_t base_index = pane_display_to_base_index(pane, pane->cur_row);
+                char name_buf[256];
+                size_t name_len = pane_get_cell_text(tui, pane, base_index, 0,
+                        name_buf, sizeof(name_buf) - 1);
+                if (name_len >= sizeof(name_buf)) name_len = sizeof(name_buf) - 1;
+                name_buf[name_len] = '\0';
+
+                // Find matching sheet
+                size_t sidx = (size_t)-1;
+                for (size_t i = 0; i < tui->xlsx->sheet_count; i++) {
+                    const char *sn = tui->xlsx->sheets[i].name;
+                    if (sn && strcmp(sn, name_buf) == 0) { sidx = i; break; }
+                }
+                if (sidx == (size_t)-1) break;
+
+                // Materialize sheet -> CSV buffer
+                Buffer sheet_buf;
+                if (!xlsx_load_sheet_as_csv(tui->xlsx, sidx, &sheet_buf)) break;
+
+                ParsedCSV sheet_csv = parsed_csv_init(sheet_buf);
+                if (sheet_csv.cells == NULL || sheet_csv.row_start == NULL) {
+                    free(sheet_buf.data); break;
+                }
+                ParseResult r = parsed_csv_parse(&sheet_csv, ',');
+                if (r != PARSE_OK || sheet_csv.row_count == 0) {
+                    parsed_csv_free(&sheet_csv); break;
+                }
+
+                ParsedCSV *registered = tui_register_csv(tui, sheet_csv);
+                if (!registered) { parsed_csv_free(&sheet_csv); break; }
+
+                Pane *new_pane = panes_add(tui);
+                if (!new_pane) break;  // csv stays in registry, freed at exit
+                if (!pane_init_csv(new_pane, tui, registered, NULL, 0, PANE_CSV)) {
+                    tui->pane_count--;
+                    break;
+                }
+                tui->active_pane = tui->pane_count - 1;
+                pane_autofit_initial_widths(tui, &tui->panes[tui->active_pane]);
             }
             break;
     }
@@ -2218,69 +3595,118 @@ int main(int argc, char *argv[]) {
     }
 
     if (!filepath) {
-        fprintf(stderr, "usage: %s [-n] <file.csv>\n", argv[0]);
+        fprintf(stderr, "usage: %s [-n] <file.csv | file.xlsx>\n", argv[0]);
         fprintf(stderr, "  -n  no header row\n");
         return 1;
     }
 
-    Buffer buf = buffer_load(filepath);
-    if (buf.data == NULL && buf.len > 0) return 1;
-
-    ParsedCSV csv = parsed_csv_init(buf);
-    if (csv.cells == NULL || csv.row_start == NULL) {
-        fprintf(stderr, "out of memory\n");
-        if (buf.data) munmap(buf.data, buf.len);
-        return 1;
+    // Detect xlsx by extension (case-insensitive).
+    bool is_xlsx = false;
+    {
+        size_t pl = strlen(filepath);
+        if (pl >= 5 && strcasecmp(filepath + pl - 5, ".xlsx") == 0) is_xlsx = true;
     }
 
-    char delim_to_use = ',';
+    // Initialize TUI now so we can register csvs/xlsx into it incrementally.
+    TUI tui = {0};
+    tui.has_header = has_header;
 
-    if (user_delim_set) {
-        delim_to_use = delimiter;
+    PaneKind primary_kind = PANE_CSV;
+    ParsedCSV *primary_csv = NULL;
+
+    if (is_xlsx) {
+        XlsxFile *xf = malloc(sizeof(XlsxFile));
+        if (!xf || !xlsx_open(filepath, xf)) {
+            free(xf);
+            fprintf(stderr, "failed to open xlsx: %s\n", filepath);
+            return 1;
+        }
+        tui.xlsx = xf;
+
+        if (xf->sheet_count == 0) {
+            fprintf(stderr, "xlsx contains no sheets\n");
+            xlsx_close(xf); free(xf);
+            return 1;
+        }
+
+        // Build the synthetic sheet-list CSV.
+        Buffer sl_buf;
+        if (!xlsx_build_sheet_list_csv(xf, &sl_buf)) {
+            fprintf(stderr, "out of memory\n");
+            xlsx_close(xf); free(xf);
+            return 1;
+        }
+        ParsedCSV sl_csv = parsed_csv_init(sl_buf);
+        if (sl_csv.cells == NULL || sl_csv.row_start == NULL) {
+            fprintf(stderr, "out of memory\n");
+            free(sl_buf.data);
+            xlsx_close(xf); free(xf);
+            return 1;
+        }
+        ParseResult r = parsed_csv_parse(&sl_csv, ',');
+        if (r != PARSE_OK) {
+            fprintf(stderr, "internal: failed to parse synthetic sheet list\n");
+            parsed_csv_free(&sl_csv);
+            xlsx_close(xf); free(xf);
+            return 1;
+        }
+        primary_csv = tui_register_csv(&tui, sl_csv);
+        if (!primary_csv) {
+            fprintf(stderr, "out of memory\n");
+            parsed_csv_free(&sl_csv);
+            xlsx_close(xf); free(xf);
+            return 1;
+        }
+        primary_kind = PANE_SHEET_LIST;
     } else {
-        if (!autodetect_delimiter_first_lines(&buf, &delim_to_use)) {
-            fprintf(stderr,
-                    "could not detect delimiter; specify one with -d \",\" (or -d \"|\", -d \"\\\\t\", -d \";\")\n");
+        Buffer buf = buffer_load(filepath);
+        if (buf.data == NULL && buf.len > 0) return 1;
+
+        ParsedCSV csv = parsed_csv_init(buf);
+        if (csv.cells == NULL || csv.row_start == NULL) {
+            fprintf(stderr, "out of memory\n");
+            if (buf.data) munmap(buf.data, buf.len);
+            return 1;
+        }
+
+        char delim_to_use = ',';
+        if (user_delim_set) {
+            delim_to_use = delimiter;
+        } else {
+            if (!autodetect_delimiter_first_lines(&buf, &delim_to_use)) {
+                fprintf(stderr,
+                        "could not detect delimiter; specify one with -d \",\" (or -d \"|\", -d \"\\\\t\", -d \";\")\n");
+                parsed_csv_free(&csv);
+                return 1;
+            }
+        }
+
+        ParseResult result = parsed_csv_parse(&csv, delim_to_use);
+        if (result != PARSE_OK) {
+            const char *err;
+            switch (result) {
+                case PARSE_OOM: err = "out of memory"; break;
+                case PARSE_INVALID: err = "invalid CSV format"; break;
+                case PARSE_OVERFLOW: err = "overflow"; break;
+                default: err = "unknown error"; break;
+            }
+            fprintf(stderr, "parse failed: %s\n", err);
             parsed_csv_free(&csv);
             return 1;
         }
-    }
 
-    ParseResult result = parsed_csv_parse(&csv, delim_to_use);
-    if (result != PARSE_OK) {
-        const char *err;
-        switch (result) {
-            case PARSE_OOM: err = "out of memory"; break;
-            case PARSE_INVALID: err = "invalid CSV format"; break;
-            case PARSE_OVERFLOW: err = "overflow"; break;
-            default: err = "unknown error"; break;
+        if (csv.row_count == 0) {
+            fprintf(stderr, "empty file\n");
+            parsed_csv_free(&csv);
+            return 0;
         }
-        fprintf(stderr, "parse failed: %s\n", err);
-        parsed_csv_free(&csv);
-        return 1;
-    }
 
-    if (csv.row_count == 0) {
-        fprintf(stderr, "empty file\n");
-        parsed_csv_free(&csv);
-        return 0;
-    }
-
-    // Initialize TUI
-    TUI tui = {0};
-    tui.csv = &csv;
-    tui.has_header = has_header;
-    tui.num_cols = csv.max_cols;
-
-    // Initialize column widths
-    tui.col_widths = malloc(tui.num_cols * sizeof(int));
-    if (!tui.col_widths) {
-        fprintf(stderr, "out of memory\n");
-        parsed_csv_free(&csv);
-        return 1;
-    }
-    for (uint16_t i = 0; i < tui.num_cols; i++) {
-        tui.col_widths[i] = DEFAULT_COL_WIDTH;
+        primary_csv = tui_register_csv(&tui, csv);
+        if (!primary_csv) {
+            fprintf(stderr, "out of memory\n");
+            parsed_csv_free(&csv);
+            return 1;
+        }
     }
 
     // Initialize panes
@@ -2288,18 +3714,24 @@ int main(int argc, char *argv[]) {
     tui.panes = malloc(tui.pane_cap * sizeof(Pane));
     if (!tui.panes) {
         fprintf(stderr, "out of memory\n");
-        free(tui.col_widths);
-        parsed_csv_free(&csv);
+        if (tui.xlsx) { xlsx_close(tui.xlsx); free(tui.xlsx); }
+        tui_free_csvs(&tui);
         return 1;
     }
 
-    // Create main pane
-    pane_init_csv(&tui.panes[0], &tui, NULL, 0);
+    // Create primary pane
+    if (!pane_init_csv(&tui.panes[0], &tui, primary_csv, NULL, 0, primary_kind)) {
+        fprintf(stderr, "out of memory\n");
+        free(tui.panes);
+        if (tui.xlsx) { xlsx_close(tui.xlsx); free(tui.xlsx); }
+        tui_free_csvs(&tui);
+        return 1;
+    }
     tui.pane_count = 1;
     tui.active_pane = 0;
 
     tui_get_size(&tui);
-    tui_autofit_initial_widths(&tui);
+    pane_autofit_initial_widths(&tui, &tui.panes[0]);
 
     tui_enable_raw(&tui);
     tui_run(&tui);
@@ -2313,8 +3745,8 @@ int main(int argc, char *argv[]) {
         pane_free(&tui.panes[i]);
     }
     free(tui.panes);
-    free(tui.col_widths);
-    parsed_csv_free(&csv);
+    tui_free_csvs(&tui);
+    if (tui.xlsx) { xlsx_close(tui.xlsx); free(tui.xlsx); }
 
     return 0;
 }
