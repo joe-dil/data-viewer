@@ -170,13 +170,13 @@ static ParseResult parsed_csv_parse(ParsedCSV *csv, char delimiter) {
                 if (i >= len) break;
                 cell_start = i; flags = 0;
                 if (c == '"') { state = IN_QUOTED; cell_start = i + 1; }
-                else if (c == delimiter) { ParseResult r = emit_cell(csv, cell_start, 0, &col, flags); if (r != PARSE_OK) return r; }
                 else if (c == '\n') { ParseResult r = emit_cell(csv, cell_start, 0, &col, flags); if (r != PARSE_OK) return r; r = finalize_row(csv, &col); if (r != PARSE_OK) return r; }
+                else if (c == delimiter) { ParseResult r = emit_cell(csv, cell_start, 0, &col, flags); if (r != PARSE_OK) return r; }
                 else state = IN_UNQUOTED;
                 break;
             case IN_UNQUOTED:
-                if (c == delimiter) { ParseResult r = emit_cell(csv, cell_start, i - cell_start, &col, flags); if (r != PARSE_OK) return r; state = FIELD_START; }
-                else if (c == '\n') { ParseResult r = emit_cell(csv, cell_start, i - cell_start, &col, flags); if (r != PARSE_OK) return r; r = finalize_row(csv, &col); if (r != PARSE_OK) return r; state = FIELD_START; }
+                if (c == '\n') { ParseResult r = emit_cell(csv, cell_start, i - cell_start, &col, flags); if (r != PARSE_OK) return r; r = finalize_row(csv, &col); if (r != PARSE_OK) return r; state = FIELD_START; }
+                else if (c == delimiter) { ParseResult r = emit_cell(csv, cell_start, i - cell_start, &col, flags); if (r != PARSE_OK) return r; state = FIELD_START; }
                 break;
             case IN_QUOTED:
                 if (c == '"') { state = QUOTE_IN_QUOTED; quoted_cell_len = i - cell_start; }
@@ -1754,7 +1754,10 @@ static bool autodetect_delimiter_first_lines(const Buffer *buf, char *out_delim)
         }
     }
 
-    if (best_k == -1) return false;
+    if (best_k == -1) {
+        if (lines_seen > 0) { *out_delim = '\n'; return true; }
+        return false;
+    }
     *out_delim = CANDS[best_k];
     return true;
 }
