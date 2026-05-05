@@ -14,7 +14,7 @@
 '<','>'     jump to prev/next distinct value in column
 '_'         auto-expand current column width
 'enter'     open selected sheet (xlsx sheet-list only)
-'y','Y'     yank current cell / current row (CSV) to clipboard
+'y','Y'     yank current cell / current row (comma seperated) to clipboard
 ctrl+c      force quit
 ctrl+d/u    half page down/up
 h,j,k,l     left/down/up/right
