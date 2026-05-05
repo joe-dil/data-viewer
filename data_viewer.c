@@ -1602,8 +1602,9 @@ typedef struct Pane {
 
 #define DEFAULT_COL_WIDTH 16
 #define MAX_COL_WIDTH 256
-#define COL_SEP " | "
-#define COL_SEP_LEN 3
+#define COL_SEP " │ "             // bytes: ' ' + UTF-8 │ (3 bytes) + ' '
+#define COL_SEP_BYTES (sizeof(COL_SEP) - 1)  // 5 bytes
+#define COL_SEP_LEN 3              // terminal columns occupied (┊ is one column)
 
 typedef struct {
     bool has_header;
@@ -2839,13 +2840,14 @@ static void tui_draw(TUI *tui) {
         uint16_t last_col_drawn = pane->view_left;
         for (uint16_t c = pane->view_left; c < num_cols; c++) {
             bool is_first = (c == pane->view_left);
-            int sep_len = is_first ? 0 : 3;
+            int sep_len = is_first ? 0 : COL_SEP_LEN;
 
             if (tui->term_cols - x < sep_len + 1) break;
 
             if (!is_first) {
-                buf[pos++] = ' '; buf[pos++] = '|'; buf[pos++] = ' ';
-                x += 3;
+                memcpy(buf + pos, COL_SEP, COL_SEP_BYTES);
+                pos += COL_SEP_BYTES;
+                x += COL_SEP_LEN;
             }
 
             int avail = tui->term_cols - x - 1;
@@ -2900,14 +2902,16 @@ static void tui_draw(TUI *tui) {
 
         for (uint16_t c = pane->view_left; c < num_cols; c++) {
             bool is_first = (c == pane->view_left);
-            int sep_len = is_first ? 0 : 3;
+            int sep_len = is_first ? 0 : COL_SEP_LEN;
 
             if (tui->term_cols - x < sep_len + 1) break;
 
             if (!is_first) {
-                pos += snprintf(buf + pos, sizeof(buf) - pos, "\x1b[0m");
-                buf[pos++] = ' '; buf[pos++] = '|'; buf[pos++] = ' ';
-                x += 3;
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        is_cur_row ? "\x1b[0m\x1b[4m" : "\x1b[0m");
+                memcpy(buf + pos, COL_SEP, COL_SEP_BYTES);
+                pos += COL_SEP_BYTES;
+                x += COL_SEP_LEN;
             }
 
             int avail = tui->term_cols - x - 1;
