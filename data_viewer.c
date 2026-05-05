@@ -3132,6 +3132,50 @@ static void tui_scroll_to_cursor(TUI *tui, Pane *pane) {
 }
 
 // ============================================================================
+// Clipboard (OSC 52)
+// ============================================================================
+//
+// OSC 52 is a terminal escape sequence that asks the terminal emulator to put
+// the given (base64-encoded) bytes on the system clipboard. Works in iTerm2,
+// modern Terminal.app, Windows Terminal, kitty, alacritty, wezterm, recent
+// xterm/gnome-terminal, and through SSH (since the local terminal does the
+// clipboard write). Some terminals require it to be enabled (e.g. tmux:
+// `set -g set-clipboard on`).
+static void clipboard_copy_osc52(const char *data, size_t len) {
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    size_t b64_len = ((len + 2) / 3) * 4;
+    size_t total   = 7 /* "\x1b]52;c;" */ + b64_len + 1 /* BEL */;
+    char *buf = malloc(total);
+    if (!buf) return;
+
+    memcpy(buf, "\x1b]52;c;", 7);
+    char *p = buf + 7;
+    size_t i = 0;
+    while (i + 3 <= len) {
+        uint32_t v = ((uint8_t)data[i] << 16) | ((uint8_t)data[i+1] << 8) | (uint8_t)data[i+2];
+        *p++ = b64[(v >> 18) & 0x3F];
+        *p++ = b64[(v >> 12) & 0x3F];
+        *p++ = b64[(v >> 6)  & 0x3F];
+        *p++ = b64[ v        & 0x3F];
+        i += 3;
+    }
+    if (i < len) {
+        uint32_t v = (uint32_t)(uint8_t)data[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)(uint8_t)data[i+1] << 8;
+        *p++ = b64[(v >> 18) & 0x3F];
+        *p++ = b64[(v >> 12) & 0x3F];
+        *p++ = (i + 1 < len) ? b64[(v >> 6) & 0x3F] : '=';
+        *p++ = '=';
+    }
+    *p++ = '\x07';
+
+    write(STDOUT_FILENO, buf, total);
+    free(buf);
+}
+
+// ============================================================================
 // Key Handling
 // ============================================================================
 
@@ -3499,6 +3543,34 @@ static void tui_process_key(TUI *tui, int key) {
         case 'N':  // previous match
             if (pane->search_has_query) {
                 pane_search(tui, pane, false);
+            }
+            break;
+
+        case 'y':  // yank current cell to system clipboard (OSC 52)
+            if (pane_rows > 0) {
+                size_t base_index = pane_display_to_base_index(pane, pane->cur_row);
+                static char tmp[65536];
+                size_t n = pane_get_cell_text(tui, pane, base_index, pane->cur_col,
+                        tmp, sizeof(tmp));
+                clipboard_copy_osc52(tmp, n);
+            }
+            break;
+
+        case 'Y':  // yank current row (RFC 4180 CSV) to system clipboard (OSC 52)
+            if (pane_rows > 0) {
+                size_t base_index = pane_display_to_base_index(pane, pane->cur_row);
+                uint16_t ncols = pane_num_cols(tui, pane);
+                CsvBuilder b = {0};
+                static char tmp[65536];
+                bool ok = true;
+                for (uint16_t c = 0; c < ncols && ok; c++) {
+                    if (c > 0) ok = csvb_append_byte(&b, ',');
+                    size_t n = pane_get_cell_text(tui, pane, base_index, c,
+                            tmp, sizeof(tmp));
+                    if (ok) ok = csvb_append_cell(&b, tmp, n);
+                }
+                if (ok) clipboard_copy_osc52(b.data, b.len);
+                free(b.data);
             }
             break;
 
