@@ -1,9 +1,3 @@
-// tui.c - Minimal ANSI TUI for CSV viewer
-// Compile: gcc -o tui tui.c
-// Usage: tui [-n] [-d <delim>] <file.csv>
-//        -n: no header row
-//        -d: one char delimiter or \t for tab
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -2956,13 +2950,41 @@ static void tui_draw(TUI *tui) {
         status_len = snprintf(status_tmp, sizeof(status_tmp), "/%s", pane->search_buf);
     } else if (pane->kind == PANE_FREQ) {
         size_t selected = pane_count_selected(tui, pane);
-        status_len = snprintf(status_tmp, sizeof(status_tmp),
-                " Pane %zu/%zu [Freq col %u]  Sel %zu  Row %zu/%zu  Col %u/3 ",
-                tui->active_pane + 1, tui->pane_count,
-                pane->freq_source_col + 1,
-                selected,
-                pane->cur_row + 1, pane_rows,
-                pane->cur_col + 1);
+        // If the parent CSV pane has a header, label the column by name.
+        char col_label[64] = {0};
+        size_t col_label_len = 0;
+        if (tui->has_header && pane->parent_csv_pane >= 0
+                && (size_t)pane->parent_csv_pane < tui->pane_count) {
+            Pane *parent = &tui->panes[pane->parent_csv_pane];
+            if (parent->csv && parent->csv->row_count > 0) {
+                const CellRef *hc = parsed_csv_get_cell(parent->csv, 0,
+                        pane->freq_source_col);
+                if (hc) {
+                    col_label_len = cell_decode(parent->csv, hc, col_label,
+                            sizeof(col_label) - 1);
+                    if (col_label_len >= sizeof(col_label))
+                        col_label_len = sizeof(col_label) - 1;
+                    col_label[col_label_len] = '\0';
+                }
+            }
+        }
+        if (col_label_len > 0) {
+            status_len = snprintf(status_tmp, sizeof(status_tmp),
+                    " Pane %zu/%zu [Freq col %s]  Sel %zu  Row %zu/%zu  Col %u/3 ",
+                    tui->active_pane + 1, tui->pane_count,
+                    col_label,
+                    selected,
+                    pane->cur_row + 1, pane_rows,
+                    pane->cur_col + 1);
+        } else {
+            status_len = snprintf(status_tmp, sizeof(status_tmp),
+                    " Pane %zu/%zu [Freq col %u]  Sel %zu  Row %zu/%zu  Col %u/3 ",
+                    tui->active_pane + 1, tui->pane_count,
+                    pane->freq_source_col + 1,
+                    selected,
+                    pane->cur_row + 1, pane_rows,
+                    pane->cur_col + 1);
+        }
     } else {
         size_t selected = pane_count_selected(tui, pane);
         status_len = snprintf(status_tmp, sizeof(status_tmp),
