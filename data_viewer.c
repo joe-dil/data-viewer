@@ -3460,8 +3460,11 @@ static void tui_process_key(TUI *tui, int key) {
             pane_sort_by_column(tui, pane, pane->cur_col, true);
             break;
 
-        case '=':  // clear sort
+        case '=':  // clear sort and clear all row selections
             pane_clear_sort(pane);
+            if (pane->selection_bitmap && pane->selection_bytes > 0) {
+                memset(pane->selection_bitmap, 0, pane->selection_bytes);
+            }
             break;
 
         case '<':  // prev distinct

@@ -10,7 +10,7 @@
 '/'     search cells for value
 'n','N' next/prev search match
 '[',']' sort column desc/asc
-'='     clear sort
+'='     clear sort and unhighlight all rows
 '<','>' jump to prev/next distinct value in column
 '_'     auto-expand current column width
 'enter' open selected sheet (xlsx sheet-list only)
