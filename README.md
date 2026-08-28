@@ -1,3 +1,7 @@
+## About
+Sometimes you just need 3k lines of C to view a text document...
+No deps
+
 ## Keybinds
 ```
 'f'         column frequency analysis
